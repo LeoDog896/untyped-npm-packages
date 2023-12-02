@@ -1,0 +1,6 @@
+{
+  "tasks": {
+    "run": "deno run -A index.ts",
+    "fmt": "deno fmt --ignore=DefinitelyTyped,raw.json"
+  }
+}
