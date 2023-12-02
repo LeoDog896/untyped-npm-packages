@@ -1,6 +1,18 @@
 import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 import ProgressBar from "https://deno.land/x/progress@v1.3.4/mod.ts";
 
+const packageSchema = z.object({
+  typings: z.string().optional().nullable(),
+  types: z.string().optional().nullable(),
+  files: z.array(z.string()).optional().nullable(),
+});
+
+function isPackageTyped(pkg: z.infer<typeof packageSchema>) {
+  return typeof pkg.typings === "string" || typeof pkg.types === "string" ||
+    (pkg.files !== null && pkg.files !== undefined && pkg.files.length > 0 &&
+      pkg.files.some((file) => file.endsWith(".d.ts")));
+}
+
 // Get DefinitelyTyped data
 {
   const url = "https://github.com/DefinitelyTyped/DefinitelyTyped.git";
@@ -40,11 +52,8 @@ import ProgressBar from "https://deno.land/x/progress@v1.3.4/mod.ts";
 
   const dataSchema = z.array(z.object({
     name: z.string(),
+    version: z.string(),
   }));
-
-  const packageSchema = z.object({
-    typings: z.string().optional().nullable(),
-  });
 
   const progress = Deno.isatty(Deno.stdout.rid)
     ? new ProgressBar({
@@ -55,45 +64,75 @@ import ProgressBar from "https://deno.land/x/progress@v1.3.4/mod.ts";
 
   let pkgCount = 0;
 
-  const names = dataSchema.parse(JSON.parse(data)).map((item) => item.name)
-    .filter(async (name) => {
-      if (name === null) {
-        console.error("Null name");
-        Deno.exit(1);
-      }
+  await Deno.mkdir("./.cache", { recursive: true });
 
-      const flattenedName = name.startsWith("@") ? name.substring(1).replace("/", "__") : name;
+  const names = await Promise.all(
+    dataSchema.parse(JSON.parse(data))
+      .map(async ({ name, version }) => {
+        if (name === null) {
+          console.error("Null name");
+          Deno.exit(1);
+        }
 
-      if (
-        await Deno.stat(`./DefinitelyTyped/types/${flattenedName}`).catch(() => null) !==
-          null
-      ) {
+        const flattenedName = name.startsWith("@")
+          ? name.substring(1).replace("/", "__")
+          : name;
+
+        if (
+          await Deno.stat(`./DefinitelyTyped/types/${flattenedName}`).catch(
+            () => null,
+          ) !==
+            null
+        ) {
+          if (progress) {
+            progress.render(++pkgCount);
+          }
+
+          return undefined;
+        }
+
+        const cacheInfo = await Deno.readTextFile(
+          `./.cache/${flattenedName}__${version}`,
+        ).catch(() => null);
+
+        if (cacheInfo !== null) {
+          if (progress) {
+            progress.render(++pkgCount);
+          }
+
+          const parsedCacheInfo = packageSchema.parse(JSON.parse(cacheInfo));
+
+          // cache hit - make sure that the package is not typed
+          return isPackageTyped(parsedCacheInfo) ? undefined : name;
+        }
+
+        let res: z.infer<typeof packageSchema> | undefined;
+        while (res === undefined) {
+          try {
+            res = packageSchema.parse(
+              await fetch(`http://registry.npmjs.org/${name}/${version}`).then((
+                res,
+              ) => res.json()),
+            );
+          } catch (e) {
+            console.error(e);
+          }
+        }
+
         if (progress) {
           progress.render(++pkgCount);
         }
 
-        return false
-      }
+        await Deno.writeTextFile(
+          `./.cache/${flattenedName}__${version}`,
+          JSON.stringify(res),
+        );
 
-      let res: z.infer<typeof packageSchema> | undefined;
-      while (res === undefined) {
-        try {
-          res = packageSchema.parse(
-            await fetch(`http://registry.npmjs.org/${name}/latest`).then((res) =>
-              res.json()
-            ),
-          );
-        } catch (e) {
-          console.error(e);
-        }
-      }
+        return isPackageTyped(res) ? undefined : name;
+      }),
+  ).then((names) => names.filter((name) => name !== undefined));
 
-      if (progress) {
-        progress.render(++pkgCount);
-      }
+  console.log(`\n${names.length} packages not typed`);
 
-      return res.typings === undefined;
-    });
-
-  await Deno.writeTextFile("./names.json", JSON.stringify(names));
+  await Deno.writeTextFile("./names.json", JSON.stringify(names, null, 2));
 }
