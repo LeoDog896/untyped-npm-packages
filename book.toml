@@ -1,0 +1,7 @@
+[book]
+title = "Untyped NPM Packages"
+
+[output.html]
+site-url = "/untyped-npm-packages"
+git-repository-url = "https://github.com/LeoDog896/untyped-npm-packages"
+git-repository-icon = "fa-github"

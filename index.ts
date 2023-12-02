@@ -1,16 +1,75 @@
 import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 import ProgressBar from "https://deno.land/x/progress@v1.3.4/mod.ts";
+import { tgz } from "https://deno.land/x/compress@v0.4.4/mod.ts";
+import { walk } from "https://deno.land/std@0.208.0/fs/walk.ts";
+
+const info = ".___utp___info___";
 
 const packageSchema = z.object({
+  name: z.string(),
+  version: z.string(),
   typings: z.string().optional().nullable(),
   types: z.string().optional().nullable(),
   files: z.array(z.string()).optional().nullable(),
+  dist: z.object({
+    tarball: z.string(),
+    shasum: z.string(),
+  }),
 });
 
-function isPackageTyped(pkg: z.infer<typeof packageSchema>) {
-  return typeof pkg.typings === "string" || typeof pkg.types === "string" ||
+function normalizeName(name: string) {
+  return name.startsWith("@") ? name.substring(1).replace("/", "__") : name;
+}
+
+async function isPackageTyped(pkg: z.infer<typeof packageSchema>) {
+  if (
+    typeof pkg.typings === "string" || typeof pkg.types === "string" ||
     (pkg.files !== null && pkg.files !== undefined && pkg.files.length > 0 &&
-      pkg.files.some((file) => file.endsWith(".d.ts")));
+      pkg.files.some((file) => file.endsWith(".d.ts")))
+  ) {
+    return true;
+  }
+
+  // the files property doesnt exist, lets inspect the unzipped tarball
+  for await (
+    const entry of walk(
+      `./.cache/${normalizeName(pkg.name)}__${pkg.version}/package`,
+    )
+  ) {
+    if (entry.path.endsWith(".d.ts")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function fetchAndUnzip(url: string, dir: string) {
+  try {
+    const res = await fetch(url);
+
+    const body = res.body;
+
+    if (body === null) {
+      throw new Error(`Failed to fetch ${url}: ${res.statusText}`);
+    }
+
+    const location = await Deno.makeTempFile();
+
+    {
+      const zip = await Deno.open(location, { create: true, write: true });
+      await body.pipeTo(zip.writable);
+    }
+
+    await tgz.uncompress(location, dir);
+  } catch (e) {
+    console.error(e);
+
+    await Deno.remove(dir, { recursive: true });
+    await Deno.mkdir(dir, { recursive: true });
+
+    await fetchAndUnzip(url, dir);
+  }
 }
 
 // Get DefinitelyTyped data
@@ -74,10 +133,9 @@ function isPackageTyped(pkg: z.infer<typeof packageSchema>) {
           Deno.exit(1);
         }
 
-        const flattenedName = name.startsWith("@")
-          ? name.substring(1).replace("/", "__")
-          : name;
+        const flattenedName = normalizeName(name);
 
+        // dts hit
         if (
           await Deno.stat(`./DefinitelyTyped/types/${flattenedName}`).catch(
             () => null,
@@ -92,7 +150,7 @@ function isPackageTyped(pkg: z.infer<typeof packageSchema>) {
         }
 
         const cacheInfo = await Deno.readTextFile(
-          `./.cache/${flattenedName}__${version}`,
+          `./.cache/${flattenedName}__${version}/${info}`,
         ).catch(() => null);
 
         if (cacheInfo !== null) {
@@ -103,7 +161,7 @@ function isPackageTyped(pkg: z.infer<typeof packageSchema>) {
           const parsedCacheInfo = packageSchema.parse(JSON.parse(cacheInfo));
 
           // cache hit - make sure that the package is not typed
-          return isPackageTyped(parsedCacheInfo) ? undefined : name;
+          return await isPackageTyped(parsedCacheInfo) ? undefined : name;
         }
 
         let res: z.infer<typeof packageSchema> | undefined;
@@ -119,16 +177,25 @@ function isPackageTyped(pkg: z.infer<typeof packageSchema>) {
           }
         }
 
+        await Deno.mkdir(`./.cache/${flattenedName}__${version}`, {
+          recursive: true,
+        });
+
+        await fetchAndUnzip(
+          res.dist.tarball,
+          `./.cache/${flattenedName}__${version}`,
+        );
+
+        await Deno.writeTextFile(
+          `./.cache/${flattenedName}__${version}/${info}`,
+          JSON.stringify(res),
+        );
+
         if (progress) {
           progress.render(++pkgCount);
         }
 
-        await Deno.writeTextFile(
-          `./.cache/${flattenedName}__${version}`,
-          JSON.stringify(res),
-        );
-
-        return isPackageTyped(res) ? undefined : name;
+        return await isPackageTyped(res) ? undefined : name;
       }),
   ).then((names) => names.filter((name) => name !== undefined));
 
